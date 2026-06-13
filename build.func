@@ -5759,6 +5759,26 @@ create_lxc_container() {
     msg_ok "Downloaded LXC Template"
   }
 
+  # Host architecture: aarch64/arm64 uses custom templates; x86_64 uses pveam
+  HOST_ARCH=$(uname -m)
+
+  # Unified dispatcher: arm64 → download_arm64_template; x86_64 → pveam re-download
+  # Arguments intentionally accept (os variant dest) for arm64 parity but on x86_64
+  # we re-download the already-resolved $TEMPLATE via pveam (dest arg unused there).
+  _download_template() {
+    local _os="$1" _variant="$2" _dest="$3"
+    if [[ "$HOST_ARCH" == "aarch64" || "$HOST_ARCH" == "arm64" ]]; then
+      download_arm64_template "$_os" "$_variant" "$_dest"
+    else
+      msg_info "Re-downloading template $TEMPLATE via pveam"
+      pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null 2>&1 || {
+        msg_error "Failed to re-download template $TEMPLATE via pveam"
+        exit 208
+      }
+      msg_ok "Downloaded LXC Template"
+    fi
+  }
+
   # ------------------------------------------------------------------------------
   # Required input variables
   # ------------------------------------------------------------------------------
@@ -5923,7 +5943,7 @@ create_lxc_container() {
   fi
 
   # ------------------------------------------------------------------------------
-  # Template discovery & validation (ARM64 custom templates)
+  # Template discovery & validation (architecture-aware)
   # ------------------------------------------------------------------------------
   msg_info "Preparing template"
 
@@ -5933,26 +5953,67 @@ create_lxc_container() {
     exit 207
   fi
 
-  TEMPLATE="${PCT_OSTYPE}-${CUSTOM_TEMPLATE_VARIANT}-rootfs.tar.xz"
-  TEMPLATE_PATH="$(resolve_template_storage_path "$TEMPLATE_STORAGE" "$TEMPLATE")"
-  TEMPLATE_SOURCE="custom-arm64"
+  if [[ "$HOST_ARCH" == "aarch64" || "$HOST_ARCH" == "arm64" ]]; then
+    # ARM64 host: use custom arm64 rootfs templates
+    TEMPLATE="${PCT_OSTYPE}-${CUSTOM_TEMPLATE_VARIANT}-rootfs.tar.xz"
+    TEMPLATE_PATH="$(resolve_template_storage_path "$TEMPLATE_STORAGE" "$TEMPLATE")"
+    TEMPLATE_SOURCE="custom-arm64"
 
-  if [[ ! -f "$TEMPLATE_PATH" ]]; then
-    download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
+    if [[ ! -f "$TEMPLATE_PATH" ]]; then
+      download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
+    else
+      msg_ok "Template ${BL}$TEMPLATE${CL} found locally."
+    fi
+
+    if [[ "$(stat -c%s "$TEMPLATE_PATH")" -lt 1000000 ]]; then
+      msg_warn "Template file too small – re-downloading."
+      rm -f "$TEMPLATE_PATH"
+      download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
+    fi
+
+    if ! tar -tf "$TEMPLATE_PATH" &>/dev/null; then
+      msg_warn "Template appears corrupted – re-downloading."
+      rm -f "$TEMPLATE_PATH"
+      download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
+    fi
   else
-    msg_ok "Template ${BL}$TEMPLATE${CL} found locally."
-  fi
+    # x86_64 (amd64) host: use standard pveam templates
+    TEMPLATE=$(pveam available --section system 2>/dev/null \
+      | awk -v os="$PCT_OSTYPE" -v var="$CUSTOM_TEMPLATE_VARIANT" \
+          'tolower($2) ~ os && tolower($2) ~ var {print $2; exit}')
+    if [[ -z "$TEMPLATE" ]]; then
+      TEMPLATE=$(pveam available --section system 2>/dev/null \
+        | awk -v os="$PCT_OSTYPE" 'tolower($2) ~ os {print $2; exit}')
+    fi
+    if [[ -z "$TEMPLATE" ]]; then
+      msg_error "No pveam template found for ${PCT_OSTYPE} ${PCT_OSVERSION:-}. Run: pveam update"
+      exit 207
+    fi
+    TEMPLATE_PATH="$(resolve_template_storage_path "$TEMPLATE_STORAGE" "$TEMPLATE")"
+    TEMPLATE_SOURCE="pveam-amd64"
 
-  if [[ "$(stat -c%s "$TEMPLATE_PATH")" -lt 1000000 ]]; then
-    msg_warn "Template file too small – re-downloading."
-    rm -f "$TEMPLATE_PATH"
-    download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
-  fi
+    if [[ ! -f "$TEMPLATE_PATH" ]]; then
+      msg_info "Downloading template $TEMPLATE via pveam"
+      pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null 2>&1 || {
+        msg_error "Failed to download template $TEMPLATE. Try: pveam update && pveam download $TEMPLATE_STORAGE $TEMPLATE"
+        exit 208
+      }
+      msg_ok "Downloaded LXC Template"
+    else
+      msg_ok "Template ${BL}$TEMPLATE${CL} found locally."
+    fi
 
-  if ! tar -tf "$TEMPLATE_PATH" &>/dev/null; then
-    msg_warn "Template appears corrupted – re-downloading."
-    rm -f "$TEMPLATE_PATH"
-    download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
+    if [[ "$(stat -c%s "$TEMPLATE_PATH" 2>/dev/null || echo 0)" -lt 1000000 ]]; then
+      msg_warn "Template file too small – re-downloading."
+      rm -f "$TEMPLATE_PATH"
+      pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null 2>&1 || { msg_error "Re-download failed"; exit 208; }
+    fi
+
+    if ! tar -tf "$TEMPLATE_PATH" &>/dev/null; then
+      msg_warn "Template appears corrupted – re-downloading."
+      rm -f "$TEMPLATE_PATH"
+      pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null 2>&1 || { msg_error "Re-download failed"; exit 208; }
+    fi
   fi
 
   msg_ok "Template ${BL}$TEMPLATE${CL} [$TEMPLATE_SOURCE]"
@@ -6034,12 +6095,12 @@ create_lxc_container() {
   if [[ ! -s "$TEMPLATE_PATH" || "$(stat -c%s "$TEMPLATE_PATH" 2>/dev/null || echo 0)" -lt 1000000 ]]; then
     msg_info "Template file missing or too small – downloading"
     rm -f "$TEMPLATE_PATH"
-    download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
+    _download_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
     msg_ok "Template downloaded"
   elif ! tar -tf "$TEMPLATE_PATH" &>/dev/null; then
     msg_info "Template appears corrupted – re-downloading"
     rm -f "$TEMPLATE_PATH"
-    download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
+    _download_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
     msg_ok "Template re-downloaded"
   fi
 
@@ -6086,11 +6147,11 @@ create_lxc_container() {
       if grep -qiE 'unable to open|corrupt|invalid' "$LOGFILE"; then
         msg_info "Template may be corrupted – re-downloading"
         rm -f "$TEMPLATE_PATH"
-        download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
+        _download_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
       elif ! tar -tf "$TEMPLATE_PATH" &>/dev/null; then
         msg_warn "Template appears corrupted – re-downloading."
         rm -f "$TEMPLATE_PATH"
-        download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
+        _download_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$TEMPLATE_PATH"
       fi
 
       # Retry after repair
@@ -6101,7 +6162,7 @@ create_lxc_container() {
           LOCAL_TEMPLATE_PATH="/var/lib/vz/template/cache/$TEMPLATE"
           if [[ ! -f "$LOCAL_TEMPLATE_PATH" ]]; then
             msg_info "Downloading template to local..."
-            download_arm64_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$LOCAL_TEMPLATE_PATH"
+            _download_template "$PCT_OSTYPE" "$CUSTOM_TEMPLATE_VARIANT" "$LOCAL_TEMPLATE_PATH"
           fi
           if ! pct create "$CTID" "local:vztmpl/${TEMPLATE}" $PCT_OPTIONS >>"$LOGFILE" 2>&1; then
             # Local fallback also failed - check for LXC stack version issue
